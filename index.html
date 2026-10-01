@@ -1,0 +1,170 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Deadlock Radio</title>
+<style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #0d0f12; color: #e7e2d6; font-family: Arial, sans-serif; overflow: hidden; }
+    #bar { display: flex; gap: 8px; padding: 10px; box-sizing: border-box; background: #14171c; border-bottom: 1px solid #2a2f37; }
+    #url { flex: 1; min-width: 0; padding: 8px 10px; font-size: 15px; color: #e7e2d6; background: #0d0f12; border: 1px solid #2a2f37; border-radius: 6px; outline: none; }
+    #url:focus { border-color: #4caf82; }
+    #go { padding: 8px 16px; font-size: 15px; font-weight: bold; color: #0d0f12; background: #6fe0a8; border: 0; border-radius: 6px; cursor: pointer; }
+    #go:hover { background: #8aeabd; }
+    #wrap { position: absolute; top: 55px; left: 0; right: 0; bottom: 0; }
+    #player { width: 100%; height: 100%; }
+    #hint { position: absolute; top: 55px; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; text-align: center; color: #6a7078; font-size: 16px; padding: 0 24px; }
+</style>
+</head>
+<body>
+<div id="bar">
+    <input id="url" type="text" placeholder="Paste a YouTube link or video ID, then press Enter" autocomplete="off" spellcheck="false" />
+    <button id="go">Play</button>
+</div>
+<div id="wrap"><div id="player"></div></div>
+<div id="hint">Paste a YouTube link above to start playing.</div>
+<script>
+(function () {
+    "use strict";
+    var SKEY = 'dlm_settings';
+    var player = null, ready = false, wantVol = 30, lastId = '', lastMetaId = '', pendingId = '', pendingAt = 0, seq = 0;
+
+    function emit(obj) { obj.z = ++seq; try { document.title = JSON.stringify(obj); } catch (e) { } }
+
+    function readSettings() {
+        try { return JSON.parse(localStorage.getItem(SKEY) || 'null'); } catch (e) { return null; }
+    }
+    function writeSettings(o) { try { localStorage.setItem(SKEY, JSON.stringify(o)); } catch (e) { } }
+
+    function hello() { emit({ t: 'bridge', d: { href: location.href, saved: readSettings() } }); }
+    window.lkHello = hello;
+
+    function vdata() { try { return (player && player.getVideoData) ? player.getVideoData() : null; } catch (e) { return null; } }
+
+    function sendMeta() {
+        var d = vdata();
+        if (!d || !d.video_id) return;
+        lastMetaId = d.video_id;
+        emit({ t: 'meta', d: { id: d.video_id, title: d.title || 'Unknown', author: d.author || '' } });
+    }
+
+    function hideHint() { var h = document.getElementById('hint'); if (h) h.style.display = 'none'; }
+
+    function onState(e) {
+        if (!window.YT) return;
+        if (e.data === YT.PlayerState.PLAYING) {
+            hideHint();
+            var d = vdata();
+            if (d && d.video_id && d.video_id !== lastMetaId) sendMeta();
+            emit({ t: 'play' });
+        } else if (e.data === YT.PlayerState.PAUSED) {
+            emit({ t: 'pause' });
+        } else if (e.data === YT.PlayerState.ENDED) {
+            emit({ t: 'ended' });
+        }
+    }
+
+    window.onYouTubeIframeAPIReady = function () {
+        player = new YT.Player('player', {
+            height: '100%', width: '100%',
+            playerVars: { autoplay: 0, controls: 1, rel: 0, modestbranding: 1, playsinline: 1, iv_load_policy: 3 },
+            events: {
+                onReady: function () {
+                    ready = true;
+                    try { player.setVolume(wantVol); } catch (e) { }
+                    if (pendingId) { playId(pendingId, pendingAt); pendingId = ''; pendingAt = 0; }
+                },
+                onStateChange: onState
+            }
+        });
+    };
+    (function () { var t = document.createElement('script'); t.src = 'https://www.youtube.com/iframe_api'; document.head.appendChild(t); })();
+
+    setInterval(function () {
+        if (!ready || !player) return;
+        var st = -1;
+        try { st = player.getPlayerState(); } catch (e) { }
+        if (st === 1) {
+            var cur = 0, dur = 0, d = vdata();
+            try { cur = player.getCurrentTime() || 0; dur = player.getDuration() || 0; } catch (e) { }
+            if (d && d.video_id && d.video_id !== lastMetaId) sendMeta();
+            emit({ t: 'tick', d: { id: (d && d.video_id) || '', dur: dur, cur: cur } });
+        } else if (st === 2) {
+            emit({ t: 'st', d: { playing: false } });
+        } else {
+            emit({ t: 'hb' });
+        }
+    }, 500);
+
+    function extractId(s) {
+        s = String(s || '').trim();
+        if (!s) return '';
+        var m = s.match(/[?&]v=([A-Za-z0-9_-]{11})/) || s.match(/youtu\.be\/([A-Za-z0-9_-]{11})/) || s.match(/\/embed\/([A-Za-z0-9_-]{11})/) || s.match(/\/shorts\/([A-Za-z0-9_-]{11})/) || s.match(/^([A-Za-z0-9_-]{11})$/);
+        return m ? m[1] : '';
+    }
+
+    function playId(id, at) {
+        if (!id) return;
+        lastId = id;
+        if (!ready || !player) { pendingId = id; pendingAt = at || 0; return; }
+        try { player.loadVideoById({ videoId: id, startSeconds: at || 0 }); hideHint(); } catch (e) { }
+    }
+
+    var fadeT = null;
+    window.lkPlay = function () { try { player && player.playVideo(); } catch (e) { } };
+    window.lkPause = function () { try { player && player.pauseVideo(); } catch (e) { } };
+    window.lkSeek = function (sec) { try { player && player.seekTo(Math.max(0, Number(sec) || 0), true); } catch (e) { } };
+    window.lkSetVolume = function (v) { wantVol = Math.max(0, Math.min(100, Number(v) || 0)); try { player && player.setVolume(wantVol); } catch (e) { } };
+    window.lkFadeTo = function (to, sec) {
+        if (fadeT) { clearInterval(fadeT); fadeT = null; }
+        to = Math.max(0, Math.min(100, Number(to) || 0));
+        var from = wantVol, ms = (Number(sec) || 0) * 1000, t0 = Date.now();
+        if (!(ms > 60)) { window.lkSetVolume(to); return; }
+        fadeT = setInterval(function () {
+            var k = Math.min(1, (Date.now() - t0) / ms);
+            window.lkSetVolume(Math.round(from + (to - from) * k));
+            if (k >= 1) { clearInterval(fadeT); fadeT = null; }
+        }, 50);
+    };
+    window.lkNext = function () { try { player && player.nextVideo && player.nextVideo(); } catch (e) { } };
+    window.lkPrev = function () { try { if (player && player.getCurrentTime() > 3) { player.seekTo(0, true); return; } player && player.previousVideo && player.previousVideo(); } catch (e) { } };
+    window.lkPlayId = function (id, at) { playId(id, at); };
+    window.lkMeta = function () { lastMetaId = ''; sendMeta(); };
+    window.lkRefresh = function () { if (lastId) playId(lastId, 0); };
+    window.lkZoom = function (z) { try { document.documentElement.style.zoom = String(Number(z) || 1); } catch (e) { } };
+    window.lkRepaint = function () { };
+    window.lkSaveSettings = function (o) { if (o) writeSettings(o); };
+    window.lkAck = function () { };
+    window.lkVer = function () { };
+    window.lkFeedback = function () { };
+    window.lkPeer = function () { };
+
+    window.addEventListener('hashchange', onHash);
+    function onHash() {
+        var h = location.hash.slice(1);
+        if (!h) return;
+        var s;
+        try { s = decodeURIComponent(h); } catch (e) { return; }
+        if (s.charAt(0) === 'c' && s.charAt(1) === ':') {
+            var p = s.indexOf(':', 2);
+            var code = p >= 0 ? s.slice(p + 1) : s.slice(2);
+            if (/^\s*window\.lk[A-Za-z]/.test(code)) { try { (0, eval)(code); } catch (e) { } }
+            return;
+        }
+        var msg;
+        try { msg = JSON.parse(s); } catch (e) { return; }
+        if (msg && msg.fn && typeof window[msg.fn] === 'function') { try { window[msg.fn].apply(null, msg.a || []); } catch (e) { } }
+    }
+
+    function goPaste() { var id = extractId(document.getElementById('url').value); if (id) { playId(id, 0); window.lkPlay(); } }
+    document.getElementById('go').addEventListener('click', goPaste);
+    document.getElementById('url').addEventListener('keydown', function (e) { if (e.key === 'Enter') goPaste(); });
+
+    hello();
+    setTimeout(hello, 600);
+    setTimeout(hello, 1800);
+    if (location.hash) onHash();
+})();
+</script>
+</body>
+</html>
