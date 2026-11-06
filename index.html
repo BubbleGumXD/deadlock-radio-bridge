@@ -11,9 +11,9 @@
   The game talks to this page two ways:
     in:  the mod changes this page's URL hash to  #c:<seq>:window.lkSomething(...)
     out: this page writes JSON into document.title, the game gets it as an HTMLTitle event.
-  Everything that plays is the official YouTube embedded player, controlled by the script below.
-  v1.14: playlists, Mix autoplay for single songs, embed-blocked detection,
-         sharing / update check / feedback moved here from the old injected script.
+  Everything that plays is an official embedded player (YouTube or SoundCloud), controlled by the script below.
+  Mod v1.3: playlists, Mix autoplay for single YouTube songs, embed-blocked detection, SoundCloud,
+            sharing / update check / feedback moved here from the old injected script.
 -->
 <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #0d0f12; color: #e7e2d6; font-family: Arial, sans-serif; overflow: hidden; }
@@ -24,6 +24,10 @@
     #go:hover { background: #8aeabd; }
     #wrap { position: absolute; top: 55px; left: 0; right: 0; bottom: 0; }
     #player { width: 100%; height: 100%; }
+    #scwrap { position: absolute; top: 55px; left: 0; right: 0; bottom: 0; display: none; }
+    #scwrap iframe { width: 100%; height: 100%; border: 0; }
+    body.sc #wrap { display: none; }
+    body.sc #scwrap { display: block; }
     #hint { position: absolute; top: 55px; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; text-align: center; color: #6a7078; font-size: 16px; padding: 0 24px; }
     #gate { position: absolute; top: 55px; left: 0; right: 0; bottom: 0; display: none; flex-direction: column; align-items: center; justify-content: center; background: #0d0f12; text-align: center; padding: 0 24px; z-index: 5; }
     #gate.on { display: flex; }
@@ -34,11 +38,12 @@
 </head>
 <body>
 <div id="bar">
-    <input id="url" type="text" placeholder="Paste a YouTube link, playlist link or video ID, then press Enter" autocomplete="off" spellcheck="false" />
+    <input id="url" type="text" placeholder="Paste a YouTube song or playlist link, then press Enter" autocomplete="off" spellcheck="false" />
     <button id="go">Play</button>
 </div>
 <div id="wrap"><div id="player"></div></div>
-<div id="hint">Pick a song in the Browser tab, or paste a YouTube link above.</div>
+<div id="scwrap"></div>
+<div id="hint">Paste a YouTube song or playlist link above, or press Play on one in the Library tab.</div>
 <div id="gate"><button id="gateBtn">&#9654; Click to start Deadlock Radio</button><div id="gateSub">One click per session, then songs play on their own.</div></div>
 <script>
 (function () {
@@ -50,7 +55,10 @@
     var ID_RE = /^[A-Za-z0-9_-]{11}$/;
     var LIST_RE = /^[A-Za-z0-9_-]{2,64}$/;
 
+    var SC_RE = /^https?:\/\/((www|m|on)\.)?soundcloud\.com\/\S+$/i;
     var player = null, ready = false, wantVol = 30, lastMetaId = '', activated = false;
+    var mode = 'youtube';    // which player is showing: 'youtube' or 'soundcloud'
+    var sc = { w: null, ready: false, iframe: null, metaId: '', loading: '' };
     var pending = null;      // what to play once the player is ready / the gate is clicked
     var cur = null;          // what we last asked for: { id, list, at, mix, seekDone, startedAt }
 
@@ -186,6 +194,7 @@
     var n = 0;
     setInterval(function () {
         n++;
+        if (mode === 'soundcloud') { scTick(); return; }
         if (!ready || !player) { if (n % 4 === 0) send('hb', { n: n }); return; }
         var st = -1;
         try { st = player.getPlayerState(); } catch (e) { }
@@ -206,9 +215,109 @@
         try { player.loadVideoById({ videoId: id, startSeconds: at || 0 }); } catch (e) { }
     }
 
+    // ---------- which player is showing ----------
+    var HINTS = {
+        youtube: ['Paste a YouTube song or playlist link, then press Enter', 'Paste a YouTube song or playlist link above, or press Play on one in the Library tab.'],
+        soundcloud: ['Paste a SoundCloud track or playlist link, then press Enter', 'Paste a SoundCloud track or playlist link above, or press Play on one in the Library tab.']
+    };
+    function setMode(m) {
+        if (m !== 'youtube' && m !== 'soundcloud') return;
+        if (m === mode) return;
+        // stop the other player
+        if (m === 'soundcloud') { try { player && player.pauseVideo(); } catch (e) { } }
+        else { try { sc.w && sc.w.pause(); } catch (e) { } }
+        mode = m;
+        document.body.className = m === 'soundcloud' ? 'sc' : '';
+        var u = document.getElementById('url'); if (u) u.placeholder = HINTS[m][0];
+        var h = document.getElementById('hint');
+        if (h) {
+            h.textContent = HINTS[m][1];
+            var playing = m === 'soundcloud' ? !!sc.iframe : (ready && !!cur);
+            h.style.display = playing ? 'none' : 'flex';
+        }
+        lastMetaId = ''; sc.metaId = '';
+        send('src', { src: m });
+    }
+    window.lkSource = function (m) { setMode(String(m || '')); };
+
+    // ---------- SoundCloud ----------
+    (function () { var t = document.createElement('script'); t.src = 'https://w.soundcloud.com/player/api.js'; document.head.appendChild(t); })();
+    var SC_OPTS = '&auto_play=true&visual=true&show_comments=false&show_reposts=false&show_teaser=false&hide_related=false';
+
+    function scMeta() {
+        if (!sc.w || !sc.ready) return;
+        try {
+            sc.w.getCurrentSound(function (s) {
+                if (!s || !s.id) return;
+                var id = 'sc:' + s.id;
+                if (id === sc.metaId) return;
+                sc.metaId = id;
+                var art = String(s.artwork_url || (s.user && s.user.avatar_url) || '').replace('-large.', '-t500x500.');
+                send('meta', { id: id, title: String(s.title || 'Unknown'), author: String((s.user && s.user.username) || ''), art: art });
+            });
+        } catch (e) { }
+    }
+
+    function scTick() {
+        if (!sc.w || !sc.ready) { if (n % 4 === 0) send('hb', { n: n }); return; }
+        try {
+            sc.w.isPaused(function (paused) {
+                if (paused) { send('st', { playing: false }); return; }
+                sc.w.getPosition(function (pos) {
+                    sc.w.getDuration(function (dur) { send('tick', { id: sc.metaId, cur: (pos || 0) / 1000, dur: (dur || 0) / 1000 }); });
+                });
+                scMeta();
+            });
+        } catch (e) { }
+    }
+
+    function scBind() {
+        var E = SC.Widget.Events;
+        sc.w = SC.Widget(sc.iframe);
+        sc.w.bind(E.READY, function () { sc.ready = true; try { sc.w.setVolume(wantVol); } catch (e) { } });
+        sc.w.bind(E.PLAY, function () { hideHint(); scMeta(); send('play'); });
+        sc.w.bind(E.PAUSE, function () { send('pause'); });
+        sc.w.bind(E.FINISH, function () { send('ended'); });
+        sc.w.bind(E.ERROR, function () { sendSure('blocked', { id: sc.loading || 'soundcloud', code: 'sc' }); });
+    }
+
+    function openSc(url) {
+        setMode('soundcloud');
+        hideHint();
+        sc.loading = url;
+        sc.metaId = '';
+        if (!sc.iframe) {
+            if (!window.SC || !SC.Widget) { setTimeout(function () { openSc(url); }, 300); return; }
+            sc.iframe = document.createElement('iframe');
+            sc.iframe.allow = 'autoplay';
+            sc.iframe.src = 'https://w.soundcloud.com/player/?url=' + encodeURIComponent(url) + SC_OPTS;
+            document.getElementById('scwrap').appendChild(sc.iframe);
+            scBind();
+            return;
+        }
+        try {
+            sc.w.load(url, {
+                auto_play: true, visual: true, show_comments: false, show_reposts: false, show_teaser: false, hide_related: false,
+                callback: function () { try { sc.w.setVolume(wantVol); sc.w.play(); } catch (e) { } }
+            });
+        } catch (e) { }
+    }
+
+    window.lkOpenSc = function (url) {
+        url = String(url || '').trim();
+        if (!SC_RE.test(url) || url.length > 400) return;
+        if (activated) { openSc(url); return; }
+        pending = { sc: url };
+        setMode('soundcloud');
+        showGate();
+        send('needgesture');
+    };
+
+    // ---------- YouTube ----------
     // id: video id (may be ''), list: playlist id (may be ''), at: start seconds
     function openNow(id, list, at) {
         at = Math.max(0, Math.floor(Number(at) || 0));
+        setMode('youtube');
         if (!ready || !player) { pending = { id: id, list: list, at: at }; return; }
         hideHint();
         if (list) {
@@ -232,16 +341,25 @@
         if (!id && !list) return;
         if (activated) { openNow(id, list, at); return; }
         pending = { id: id, list: list, at: at || 0 };
+        setMode('youtube');
         showGate();
         send('needgesture');
     };
     window.lkPlayId = function (id, at) { window.lkOpen(id, '', at); };
 
     var fadeT = null;
-    window.lkPlay = function () { try { player && player.playVideo(); } catch (e) { } };
-    window.lkPause = function () { try { player && player.pauseVideo(); } catch (e) { } };
-    window.lkSeek = function (sec) { try { player && player.seekTo(Math.max(0, Number(sec) || 0), true); } catch (e) { } };
-    window.lkSetVolume = function (v) { wantVol = Math.max(0, Math.min(100, Number(v) || 0)); try { player && player.setVolume(wantVol); } catch (e) { } };
+    function isSc() { return mode === 'soundcloud' && sc.w; }
+    window.lkPlay = function () { try { if (isSc()) sc.w.play(); else player && player.playVideo(); } catch (e) { } };
+    window.lkPause = function () { try { if (isSc()) sc.w.pause(); else player && player.pauseVideo(); } catch (e) { } };
+    window.lkSeek = function (sec) {
+        sec = Math.max(0, Number(sec) || 0);
+        try { if (isSc()) sc.w.seekTo(sec * 1000); else player && player.seekTo(sec, true); } catch (e) { }
+    };
+    window.lkSetVolume = function (v) {
+        wantVol = Math.max(0, Math.min(100, Number(v) || 0));
+        try { player && player.setVolume(wantVol); } catch (e) { }
+        try { sc.w && sc.ready && sc.w.setVolume(wantVol); } catch (e) { }
+    };
     window.lkFadeTo = function (to, sec) {
         if (fadeT) { clearInterval(fadeT); fadeT = null; }
         to = Math.max(0, Math.min(100, Number(to) || 0));
@@ -253,8 +371,12 @@
             if (k >= 1) { clearInterval(fadeT); fadeT = null; }
         }, 50);
     };
-    window.lkNext = function () { try { player && player.nextVideo && player.nextVideo(); } catch (e) { } };
+    window.lkNext = function () { try { if (isSc()) sc.w.next(); else player && player.nextVideo && player.nextVideo(); } catch (e) { } };
     window.lkPrev = function () {
+        if (isSc()) {
+            try { sc.w.getPosition(function (pos) { if (pos > 3000) sc.w.seekTo(0); else sc.w.prev(); }); } catch (e) { }
+            return;
+        }
         try {
             if (!player) return;
             if (player.getCurrentTime() > 3) { player.seekTo(0, true); return; }
@@ -262,8 +384,8 @@
             if (i > 0) player.previousVideo(); else player.seekTo(0, true);
         } catch (e) { }
     };
-    window.lkMeta = function () { lastMetaId = ''; sendMeta(); };
-    window.lkRefresh = function () { if (cur) openNow(cur.id, cur.mix ? '' : cur.list, 0); };
+    window.lkMeta = function () { if (mode === 'soundcloud') { sc.metaId = ''; scMeta(); return; } lastMetaId = ''; sendMeta(); };
+    window.lkRefresh = function () { if (mode === 'soundcloud') { if (sc.loading) openSc(sc.loading); return; } if (cur) openNow(cur.id, cur.mix ? '' : cur.list, 0); };
     window.lkZoom = function (z) { try { document.documentElement.style.zoom = String(Number(z) || 1); } catch (e) { } };
     window.lkRepaint = function () {
         try {
@@ -399,8 +521,8 @@
     function doActivate() {
         activated = true;
         hideGate();
-        if (pending) { var p = pending; pending = null; openNow(p.id, p.list, p.at); }
-        else { try { player && player.playVideo(); } catch (e) { } }
+        if (pending) { var p = pending; pending = null; if (p.sc) openSc(p.sc); else openNow(p.id, p.list, p.at); }
+        else { window.lkPlay(); }
         send('activated');
     }
     document.getElementById('gateBtn').addEventListener('click', doActivate);
@@ -409,6 +531,7 @@
     function parseInput(s) {
         s = String(s || '').trim();
         if (!s) return null;
+        if (SC_RE.test(s)) return { sc: s };
         var list = (s.match(/[?&]list=([A-Za-z0-9_-]+)/) || [])[1] || '';
         var vm = s.match(/[?&]v=([A-Za-z0-9_-]{11})/) || s.match(/youtu\.be\/([A-Za-z0-9_-]{11})/) || s.match(/\/embed\/([A-Za-z0-9_-]{11})/) || s.match(/\/shorts\/([A-Za-z0-9_-]{11})/) || s.match(/^([A-Za-z0-9_-]{11})$/);
         var t = parseInt((s.match(/[?&]t=(\d+)/) || [])[1] || '0', 10) || 0;
@@ -419,7 +542,9 @@
     function goPaste() {
         activated = true; hideGate(); send('activated');
         var info = parseInput(document.getElementById('url').value);
-        if (info) { pending = null; window.lkOpen(info.video, info.list, info.at); }
+        if (!info) return;
+        pending = null;
+        if (info.sc) window.lkOpenSc(info.sc); else window.lkOpen(info.video, info.list, info.at);
     }
     document.getElementById('go').addEventListener('click', goPaste);
     document.getElementById('url').addEventListener('keydown', function (e) { if (e.key === 'Enter') goPaste(); });
