@@ -4,6 +4,15 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Deadlock Radio</title>
+<!--
+  Deadlock Radio player page (Panel B). Hosted on GitHub Pages.
+  The game talks to this page two ways:
+    in:  the mod changes this page's URL hash to  #c:<seq>:window.lkSomething(...)
+    out: this page writes JSON into document.title, the game gets it as an HTMLTitle event.
+  Everything that plays is the official YouTube embedded player, controlled by the script below.
+  v1.14: playlists, Mix autoplay for single songs, embed-blocked detection,
+         sharing / update check / feedback moved here from the old injected script.
+-->
 <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #0d0f12; color: #e7e2d6; font-family: Arial, sans-serif; overflow: hidden; }
     #bar { display: flex; gap: 8px; padding: 10px; box-sizing: border-box; background: #14171c; border-bottom: 1px solid #2a2f37; }
@@ -23,106 +32,204 @@
 </head>
 <body>
 <div id="bar">
-    <input id="url" type="text" placeholder="Paste a YouTube link or video ID, then press Enter" autocomplete="off" spellcheck="false" />
+    <input id="url" type="text" placeholder="Paste a YouTube link, playlist link or video ID, then press Enter" autocomplete="off" spellcheck="false" />
     <button id="go">Play</button>
 </div>
 <div id="wrap"><div id="player"></div></div>
-<div id="hint">Paste a YouTube link above to start playing.</div>
+<div id="hint">Pick a song in the Browser tab, or paste a YouTube link above.</div>
 <div id="gate"><button id="gateBtn">&#9654; Click to start Deadlock Radio</button><div id="gateSub">One click per session, then songs play on their own.</div></div>
 <script>
 (function () {
     "use strict";
+    var API = 'https://relay-ckjvp.dlr-k7q2m9x.workers.dev/';
+    var API_KEY = 'anrKvZKLlQaJZu1ScaK9kM9z';
+    var RELAY = 'wss://relay-ckjvp.dlr-k7q2m9x.workers.dev/r/' + API_KEY + '/';
     var SKEY = 'dlm_settings';
-    var player = null, ready = false, wantVol = 30, lastId = '', lastMetaId = '', pending = null, seq = 0, activated = false, pendingPlay = null;
+    var ID_RE = /^[A-Za-z0-9_-]{11}$/;
+    var LIST_RE = /^[A-Za-z0-9_-]{2,64}$/;
 
-    function emit(obj) { obj.z = ++seq; try { document.title = JSON.stringify(obj); } catch (e) { } }
+    var player = null, ready = false, wantVol = 30, lastMetaId = '', activated = false;
+    var pending = null;      // what to play once the player is ready / the gate is clicked
+    var cur = null;          // what we last asked for: { id, list, at, mix, seekDone, startedAt }
 
-    function readSettings() {
-        try { return JSON.parse(localStorage.getItem(SKEY) || 'null'); } catch (e) { return null; }
+    // ---------- messages out (document.title) ----------
+    // Title changes too close together can get merged by the game, so space them out.
+    var outQ = [], outAt = 0, outT = null, seq = 0;
+    function flushOut() {
+        outT = null;
+        if (!outQ.length) return;
+        var wait = 70 - (Date.now() - outAt);
+        if (wait > 0) { outT = setTimeout(flushOut, wait); return; }
+        outAt = Date.now();
+        try { document.title = outQ.shift(); } catch (e) { }
+        if (outQ.length) outT = setTimeout(flushOut, 70);
     }
-    function writeSettings(o) { try { localStorage.setItem(SKEY, JSON.stringify(o)); } catch (e) { } }
+    function send(t, d) {
+        var msg = JSON.stringify({ t: t, d: d || {}, z: ++seq });
+        if (t === 'tick' || t === 'st' || t === 'hb') {
+            for (var i = outQ.length - 1; i >= 0; i--) {
+                if (outQ[i].indexOf('{"t":"' + t + '"') === 0) { outQ[i] = msg; if (!outT) flushOut(); return; }
+            }
+        }
+        outQ.push(msg);
+        if (outQ.length > 40) outQ.splice(0, outQ.length - 40);
+        if (!outT) flushOut();
+    }
+    // Important messages repeat until the mod acks them (window.lkAck).
+    var pid = Math.floor(Math.random() * 1e9).toString(36), relN = 0, relQ = {};
+    function sendSure(t, d) { d = d || {}; d.q = pid + '-' + (++relN); relQ[d.q] = { t: t, d: d, tries: 0 }; send(t, d); }
+    window.lkAck = function (q) { delete relQ[q]; };
+    setInterval(function () { for (var k in relQ) { var m = relQ[k]; if (++m.tries > 12) { delete relQ[k]; continue; } send(m.t, m.d); } }, 600);
 
-    function hello() { emit({ t: 'bridge', d: { href: location.href, saved: readSettings() } }); }
+    // ---------- settings (kept on this site's storage so they survive restarts) ----------
+    function readSettings() { try { return JSON.parse(localStorage.getItem(SKEY) || 'null'); } catch (e) { return null; } }
+    function writeSettings(o) { try { localStorage.setItem(SKEY, JSON.stringify(o)); } catch (e) { } }
+    function hello() { send('bridge', { href: location.href, saved: readSettings() }); }
     window.lkHello = hello;
 
+    // ---------- the YouTube player ----------
     function vdata() { try { return (player && player.getVideoData) ? player.getVideoData() : null; } catch (e) { return null; } }
+    function curPos() { try { return player ? (player.getCurrentTime() || 0) : 0; } catch (e) { return 0; } }
+    function hideHint() { var h = document.getElementById('hint'); if (h) h.style.display = 'none'; }
 
     function sendMeta() {
         var d = vdata();
         if (!d || !d.video_id) return;
         lastMetaId = d.video_id;
-        emit({ t: 'meta', d: { id: d.video_id, title: d.title || 'Unknown', author: d.author || '' } });
+        send('meta', { id: d.video_id, title: d.title || 'Unknown', author: d.author || '' });
+        // getVideoData can be stale right after a switch, oEmbed gives the real title
+        var vid = d.video_id;
+        fetch('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent('https://www.youtube.com/watch?v=' + vid))
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (j) { if (j && j.title && lastMetaId === vid) send('meta', { id: vid, title: String(j.title), author: String(j.author_name || ''), fixed: true }); })
+            .catch(function () { });
     }
 
-    function hideHint() { var h = document.getElementById('hint'); if (h) h.style.display = 'none'; }
+    // When a playlist loads, jump to the song that was actually clicked.
+    function fixPlaylistStart() {
+        if (!cur || cur.seekDone || !cur.list || !cur.id) return;
+        var pl = null;
+        try { pl = player.getPlaylist(); } catch (e) { }
+        if (!pl || !pl.length) return;
+        cur.seekDone = true;
+        var idx = pl.indexOf(cur.id);
+        var now = -1; try { now = player.getPlaylistIndex(); } catch (e) { }
+        if (idx > 0 && idx !== now) { try { player.playVideoAt(idx); } catch (e) { } return; }
+        if (idx < 0 && cur.mix) {
+            // The Mix didn't start with our song; play the song by itself instead.
+            send('mixmiss', { id: cur.id });
+            loadSingle(cur.id, cur.at);
+        }
+    }
 
     function onState(e) {
         if (!window.YT) return;
         if (e.data === YT.PlayerState.PLAYING) {
             hideHint();
+            fixPlaylistStart();
             var d = vdata();
             if (d && d.video_id && d.video_id !== lastMetaId) sendMeta();
-            emit({ t: 'play' });
+            send('play');
         } else if (e.data === YT.PlayerState.PAUSED) {
-            emit({ t: 'pause' });
+            send('pause');
         } else if (e.data === YT.PlayerState.ENDED) {
-            emit({ t: 'ended' });
+            send('ended');
+        } else if (e.data === YT.PlayerState.CUED || e.data === YT.PlayerState.BUFFERING) {
+            fixPlaylistStart();
         }
+    }
+
+    function onError(e) {
+        var code = e && e.data;
+        var d = vdata();
+        var id = (d && d.video_id) || (cur && cur.id) || '';
+        // A generated Mix that won't load at all: fall back to just the song.
+        if (cur && cur.mix && !cur.seekDone && (code === 2 || code === 100 || code === 5)) {
+            send('mixmiss', { id: cur.id, code: code });
+            loadSingle(cur.id, cur.at);
+            return;
+        }
+        if (code === 101 || code === 150 || code === 153) {
+            sendSure('blocked', { id: id, code: code });
+        } else {
+            sendSure('error', { id: id, code: code });
+        }
+        // In a playlist, skip past songs that can't play here.
+        var inList = false;
+        try { var pl = player.getPlaylist(); inList = !!(pl && pl.length > 1); } catch (e2) { }
+        if (inList) setTimeout(function () { try { player.nextVideo(); } catch (e3) { } }, 1200);
     }
 
     window.onYouTubeIframeAPIReady = function () {
         player = new YT.Player('player', {
             height: '100%', width: '100%',
-            playerVars: { autoplay: 0, controls: 1, rel: 0, modestbranding: 1, playsinline: 1, iv_load_policy: 3 },
+            playerVars: { autoplay: 0, controls: 1, rel: 0, playsinline: 1, iv_load_policy: 3, origin: location.origin },
             events: {
                 onReady: function () {
                     ready = true;
                     try { player.setVolume(wantVol); } catch (e) { }
-                    if (pending) { var pp = pending; pending = null; playInput(pp.info, pp.at); }
+                    if (pending && activated) { var p = pending; pending = null; openNow(p.id, p.list, p.at); }
                 },
-                onStateChange: onState
+                onStateChange: onState,
+                onError: onError
             }
         });
     };
     (function () { var t = document.createElement('script'); t.src = 'https://www.youtube.com/iframe_api'; document.head.appendChild(t); })();
 
+    var n = 0;
     setInterval(function () {
-        if (!ready || !player) return;
+        n++;
+        if (!ready || !player) { if (n % 4 === 0) send('hb', { n: n }); return; }
         var st = -1;
         try { st = player.getPlayerState(); } catch (e) { }
         if (st === 1) {
-            var cur = 0, dur = 0, d = vdata();
-            try { cur = player.getCurrentTime() || 0; dur = player.getDuration() || 0; } catch (e) { }
+            var c = 0, dur = 0, d = vdata();
+            try { c = player.getCurrentTime() || 0; dur = player.getDuration() || 0; } catch (e) { }
             if (d && d.video_id && d.video_id !== lastMetaId) sendMeta();
-            emit({ t: 'tick', d: { id: (d && d.video_id) || '', dur: dur, cur: cur } });
+            send('tick', { id: (d && d.video_id) || '', dur: dur, cur: c });
         } else if (st === 2) {
-            emit({ t: 'st', d: { playing: false } });
-        } else {
-            emit({ t: 'hb' });
+            send('st', { playing: false });
+        } else if (n % 4 === 0) {
+            send('hb', { n: n });
         }
     }, 500);
 
-    function parseInput(s) {
-        s = String(s || '').trim();
-        if (!s) return null;
-        var list = (s.match(/[?&]list=([A-Za-z0-9_-]+)/) || [])[1] || '';
-        var vm = s.match(/[?&]v=([A-Za-z0-9_-]{11})/) || s.match(/youtu\.be\/([A-Za-z0-9_-]{11})/) || s.match(/\/embed\/([A-Za-z0-9_-]{11})/) || s.match(/\/shorts\/([A-Za-z0-9_-]{11})/) || s.match(/^([A-Za-z0-9_-]{11})$/);
-        var vid = vm ? vm[1] : '';
-        if (!list && !vid) return null;
-        return { list: list, video: vid };
+    function loadSingle(id, at) {
+        cur = { id: id, list: '', at: at || 0, mix: false, seekDone: true };
+        try { player.loadVideoById({ videoId: id, startSeconds: at || 0 }); } catch (e) { }
     }
 
-    function playInput(info, at) {
-        if (!info) return;
-        if (!ready || !player) { pending = { info: info, at: at || 0 }; return; }
-        try {
-            if (info.list) { player.loadPlaylist({ list: info.list, index: 0, startSeconds: at || 0 }); lastId = ''; }
-            else { player.loadVideoById({ videoId: info.video, startSeconds: at || 0 }); lastId = info.video; }
-            hideHint();
-        } catch (e) { }
+    // id: video id (may be ''), list: playlist id (may be ''), at: start seconds
+    function openNow(id, list, at) {
+        at = Math.max(0, Math.floor(Number(at) || 0));
+        if (!ready || !player) { pending = { id: id, list: list, at: at }; return; }
+        hideHint();
+        if (list) {
+            cur = { id: id, list: list, at: at, mix: false, seekDone: !id };
+            try { player.loadPlaylist({ listType: 'playlist', list: list, index: 0, startSeconds: id ? 0 : at }); } catch (e) { }
+            return;
+        }
+        if (!id) return;
+        // A single song plays as its YouTube Mix so the next songs keep coming on their own.
+        cur = { id: id, list: 'RD' + id, at: at, mix: true, seekDone: false };
+        try { player.loadPlaylist({ listType: 'playlist', list: 'RD' + id, index: 0, startSeconds: at }); } catch (e) { loadSingle(id, at); }
     }
 
-    function playId(id, at) { playInput({ list: '', video: id }, at); }
+    window.lkOpen = function (id, list, at) {
+        id = String(id || ''); list = String(list || '');
+        if (id && !ID_RE.test(id)) id = '';
+        if (list && !LIST_RE.test(list)) list = '';
+        if (!id && !list) return;
+        // Watch Later / Liked videos are private, the embed can't play them.
+        if (list === 'WL' || list === 'LL' || list === 'LM') list = '';
+        if (!id && !list) return;
+        if (activated) { openNow(id, list, at); return; }
+        pending = { id: id, list: list, at: at || 0 };
+        showGate();
+        send('needgesture');
+    };
+    window.lkPlayId = function (id, at) { window.lkOpen(id, '', at); };
 
     var fadeT = null;
     window.lkPlay = function () { try { player && player.playVideo(); } catch (e) { } };
@@ -141,15 +248,16 @@
         }, 50);
     };
     window.lkNext = function () { try { player && player.nextVideo && player.nextVideo(); } catch (e) { } };
-    window.lkPrev = function () { try { if (player && player.getCurrentTime() > 3) { player.seekTo(0, true); return; } player && player.previousVideo && player.previousVideo(); } catch (e) { } };
-    window.lkPlayId = function (id, at) {
-        if (activated) { playId(id, at); return; }
-        pendingPlay = { id: id, at: at || 0 };
-        showGate();
-        emit({ t: 'needgesture' });
+    window.lkPrev = function () {
+        try {
+            if (!player) return;
+            if (player.getCurrentTime() > 3) { player.seekTo(0, true); return; }
+            var i = player.getPlaylistIndex();
+            if (i > 0) player.previousVideo(); else player.seekTo(0, true);
+        } catch (e) { }
     };
     window.lkMeta = function () { lastMetaId = ''; sendMeta(); };
-    window.lkRefresh = function () { if (lastId) playId(lastId, 0); };
+    window.lkRefresh = function () { if (cur) openNow(cur.id, cur.mix ? '' : cur.list, 0); };
     window.lkZoom = function (z) { try { document.documentElement.style.zoom = String(Number(z) || 1); } catch (e) { } };
     window.lkRepaint = function () {
         try {
@@ -161,12 +269,107 @@
         } catch (e) { }
     };
     window.lkSaveSettings = function (o) { if (o) writeSettings(o); };
-    window.lkAck = function () { };
-    window.lkVer = function () { };
-    window.lkFeedback = function () { };
-    window.lkPeer = function () { };
 
-    window.addEventListener('hashchange', onHash);
+    // ---------- update check / what's new / feedback ----------
+    function unhex(h) { var p = String(h || '').split('-'), out = ''; for (var i = 0; i < p.length; i++) if (p[i]) out += String.fromCharCode(parseInt(p[i], 16)); return out; }
+    function cleanNotes(ns) {
+        if (!Array.isArray(ns)) return null;
+        var t = function (x, k) { return String(x == null ? '' : x).replace(/[\u0000-\u001f]/g, ' ').substring(0, k); };
+        var list = function (a) { return Array.isArray(a) ? a.slice(0, 25).map(function (x) { return t(x, 220); }) : []; };
+        return ns.slice(0, 12).map(function (o) { o = o || {}; return { v: t(o.v, 20), n: list(o.n), f: list(o.f) }; });
+    }
+    window.lkVer = function (dev) {
+        fetch(API + 'v/' + API_KEY + (dev ? '?ch=dev' : ''), { cache: 'no-store' }).then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (j) { if (j && j.v) sendSure('ver', { v: String(j.v).substring(0, 20), notes: cleanNotes(j.notes) }); }).catch(function () { });
+    };
+    window.lkFeedback = function (h) {
+        fetch(API + 'f/' + API_KEY, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: unhex(h) })
+            .then(function (r) { sendSure('fbsent', { ok: !!r.ok }); }).catch(function () { sendSure('fbsent', { ok: false }); });
+    };
+
+    // ---------- song sharing with others in the match (end-to-end encrypted, via the relay) ----------
+    var peer = { ws: null, open: false, room: '', key: null, note: '', want: false, ping: null, retry: null, fails: 0, sentReal: false, lastSend: 0, sendT: null, lastReal: '', age: 0 };
+    function b64(u) { var t = ''; for (var i = 0; i < u.length; i++) t += String.fromCharCode(u[i]); return btoa(t); }
+    function unb64(t) { var r = atob(t), u = new Uint8Array(r.length); for (var i = 0; i < r.length; i++) u[i] = r.charCodeAt(i); return u; }
+    function sha(t) { return crypto.subtle.digest('SHA-256', new TextEncoder().encode(t)); }
+    function hexOf(buf) { var a = new Uint8Array(buf), h = ''; for (var i = 0; i < a.length; i++) h += (a[i] < 16 ? '0' : '') + a[i].toString(16); return h; }
+    function notePos(body) { try { var o = JSON.parse(body); if (o.c) { o.p = Math.max(0, Math.round(curPos())); return JSON.stringify(o); } } catch (e) { } return body; }
+    function peerClose() {
+        var ws = peer.ws; peer.ws = null; peer.open = false; peer.room = ''; peer.key = null;
+        if (peer.ping) { clearInterval(peer.ping); peer.ping = null; }
+        if (peer.retry) { clearTimeout(peer.retry); peer.retry = null; }
+        if (peer.sendT) { clearTimeout(peer.sendT); peer.sendT = null; }
+        peer.fails = 0; peer.sentReal = false; peer.lastReal = '';
+        if (ws) { try { ws.close(); } catch (e) { } sendSure('peerstate', { on: false }); }
+    }
+    function peerSendNote() {
+        if (!peer.ws || !peer.open || !peer.key) return;
+        if (!peer.note && !peer.sentReal) return;
+        // relay drops notes < 2s apart
+        var wait = 2200 - (Date.now() - peer.lastSend);
+        if (wait > 0) { if (!peer.sendT) peer.sendT = setTimeout(function () { peer.sendT = null; peerSendNote(); }, wait); return; }
+        peer.lastSend = Date.now();
+        var real = !!peer.note;
+        var last = {}; try { last = JSON.parse(peer.lastReal || '{}'); } catch (e) { }
+        var body = peer.note ? notePos(peer.note) : JSON.stringify({ off: 1, h: last.h || '', n: last.n || '' });
+        if (real) peer.lastReal = peer.note;
+        var iv = crypto.getRandomValues(new Uint8Array(12)); var ws = peer.ws;
+        crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, peer.key, new TextEncoder().encode(body)).then(function (ct) {
+            var all = new Uint8Array(12 + ct.byteLength); all.set(iv, 0); all.set(new Uint8Array(ct), 12);
+            try { ws.send(b64(all)); if (real) peer.sentReal = true; sendSure('peersent', { off: !real }); } catch (e) { }
+        });
+    }
+    function peerRecv(t, age) {
+        if (!peer.key || t.length > 600) return;
+        var all; try { all = unb64(t); } catch (e) { return; }
+        if (all.length < 29) return;
+        crypto.subtle.decrypt({ name: 'AES-GCM', iv: all.slice(0, 12) }, peer.key, all.slice(12)).then(function (pt) {
+            var o = JSON.parse(new TextDecoder().decode(pt));
+            var nm = String(o.n || '').substring(0, 40); var hr = String(o.h || '').substring(0, 40);
+            if (!nm && !hr) return;
+            var m = /^y:([A-Za-z0-9_-]{11})$/.exec(String(o.c || ''));
+            var bs = String(o.b || ''); if (!/^(gold|silver|dark|neon|glass|off)$/.test(bs)) bs = '';
+            var ps = Number(o.p); if (!(ps >= 0 && ps < 36000)) ps = -1;
+            sendSure('peer', { n: nm, h: hr, id: m ? m[1] : '', t: String(o.t || '').replace(/[\u0000-\u001f]/g, '').substring(0, 60), off: !!o.off, b: bs, p: ps, age: Math.min(3600000, Math.max(0, Number(age) || 0)) });
+        }).catch(function () { });
+    }
+    function peerConnect() {
+        if (!peer.room || !peer.key || peer.ws) return;
+        var ws; try { ws = new WebSocket(RELAY + peer.room); } catch (e) { return; }
+        peer.ws = ws;
+        ws.onopen = function () {
+            if (peer.ws !== ws) return;
+            peer.open = true; peer.fails = 0; sendSure('peerstate', { on: true, room: peer.room.substring(0, 6) });
+            peerSendNote();
+            peer.ping = setInterval(function () { try { ws.send('ping'); } catch (e) { } }, 240000);
+        };
+        ws.onmessage = function (e) { var t = String(e.data); if (t === 'pong') return; if (t.indexOf('age:') === 0) { peer.age = Number(t.substring(4)) || 0; return; } var age = peer.age || 0; peer.age = 0; peerRecv(t, age); };
+        ws.onclose = function () {
+            if (peer.ws !== ws) return;
+            peer.ws = null; peer.open = false;
+            if (peer.ping) { clearInterval(peer.ping); peer.ping = null; }
+            sendSure('peerstate', { on: false });
+            peer.fails++;
+            var delays = [8000, 30000, 120000, 300000];
+            if (peer.want && peer.room && peer.fails <= 5) peer.retry = setTimeout(function () { peer.retry = null; peerConnect(); }, delays[Math.min(peer.fails - 1, delays.length - 1)]);
+        };
+    }
+    window.lkPeer = function (roomHex, noteHex, show) {
+        if (!window.crypto || !crypto.subtle || !window.WebSocket) return;
+        var src = unhex(roomHex); var note = unhex(noteHex);
+        peer.want = !!(src && (show || note));
+        if (!peer.want) { peerClose(); peer.note = note; return; }
+        sha('dlr-room|' + src).then(function (rb) {
+            var r = hexOf(rb);
+            if (r === peer.room) { if (note !== peer.note) { peer.note = note; peerSendNote(); } return; }
+            peerClose(); peer.note = note; peer.room = r;
+            return sha('dlr-note|' + API_KEY + '|' + r).then(function (kb) {
+                return crypto.subtle.importKey('raw', kb, 'AES-GCM', false, ['encrypt', 'decrypt']);
+            }).then(function (k) { if (peer.room !== r) return; peer.key = k; peerConnect(); });
+        }).catch(function () { });
+    };
+
+    // ---------- commands in (URL hash) ----------
     function onHash() {
         var h = location.hash.slice(1);
         if (!h) return;
@@ -180,21 +383,38 @@
         }
         var msg;
         try { msg = JSON.parse(s); } catch (e) { return; }
-        if (msg && msg.fn && typeof window[msg.fn] === 'function') { try { window[msg.fn].apply(null, msg.a || []); } catch (e) { } }
+        if (msg && msg.fn && /^lk[A-Za-z]+$/.test(msg.fn) && typeof window[msg.fn] === 'function') { try { window[msg.fn].apply(null, msg.a || []); } catch (e) { } }
     }
+    window.addEventListener('hashchange', onHash);
 
+    // ---------- click gate (browsers need one real click before sound) ----------
     function showGate() { var g = document.getElementById('gate'); if (g) g.className = 'on'; }
     function hideGate() { var g = document.getElementById('gate'); if (g) g.className = ''; }
     function doActivate() {
         activated = true;
         hideGate();
-        if (pendingPlay) { playId(pendingPlay.id, pendingPlay.at); pendingPlay = null; }
-        try { player && player.playVideo(); } catch (e) { }
-        emit({ t: 'activated' });
+        if (pending) { var p = pending; pending = null; openNow(p.id, p.list, p.at); }
+        else { try { player && player.playVideo(); } catch (e) { } }
+        send('activated');
     }
     document.getElementById('gateBtn').addEventListener('click', doActivate);
 
-    function goPaste() { activated = true; hideGate(); var info = parseInput(document.getElementById('url').value); if (info) { playInput(info, 0); window.lkPlay(); } }
+    // ---------- paste box ----------
+    function parseInput(s) {
+        s = String(s || '').trim();
+        if (!s) return null;
+        var list = (s.match(/[?&]list=([A-Za-z0-9_-]+)/) || [])[1] || '';
+        var vm = s.match(/[?&]v=([A-Za-z0-9_-]{11})/) || s.match(/youtu\.be\/([A-Za-z0-9_-]{11})/) || s.match(/\/embed\/([A-Za-z0-9_-]{11})/) || s.match(/\/shorts\/([A-Za-z0-9_-]{11})/) || s.match(/^([A-Za-z0-9_-]{11})$/);
+        var t = parseInt((s.match(/[?&]t=(\d+)/) || [])[1] || '0', 10) || 0;
+        var vid = vm ? vm[1] : '';
+        if (!list && !vid) return null;
+        return { list: list, video: vid, at: t };
+    }
+    function goPaste() {
+        activated = true; hideGate(); send('activated');
+        var info = parseInput(document.getElementById('url').value);
+        if (info) { pending = null; window.lkOpen(info.video, info.list, info.at); }
+    }
     document.getElementById('go').addEventListener('click', goPaste);
     document.getElementById('url').addEventListener('keydown', function (e) { if (e.key === 'Enter') goPaste(); });
 
