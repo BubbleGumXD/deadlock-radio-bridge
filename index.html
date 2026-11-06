@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<!-- YouTube's embed refuses to play (error 153) if it can't see which site it's on -->
+<meta name="referrer" content="strict-origin-when-cross-origin" />
 <title>Deadlock Radio</title>
 <!--
   Deadlock Radio player page (Panel B). Hosted on GitHub Pages.
@@ -163,7 +165,11 @@
     window.onYouTubeIframeAPIReady = function () {
         player = new YT.Player('player', {
             height: '100%', width: '100%',
-            playerVars: { autoplay: 0, controls: 1, rel: 0, playsinline: 1, iv_load_policy: 3, origin: location.origin },
+            playerVars: (function () {
+                var pv = { autoplay: 0, controls: 1, rel: 0, playsinline: 1, iv_load_policy: 3 };
+                if (/^https?:$/.test(location.protocol)) pv.origin = location.origin;
+                return pv;
+            })(),
             events: {
                 onReady: function () {
                     ready = true;
